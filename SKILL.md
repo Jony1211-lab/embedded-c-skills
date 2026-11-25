@@ -1,11 +1,11 @@
 ---
 name: embedded-c-conventions
-description: Enforce embedded C coding standards for clarity and maintainability. Apply this skill whenever reviewing or writing embedded C code, or when the user mentions code quality, C conventions, naming standards, variable naming, comments, error handling, function design, or code style. Check for magic numbers replaced with macros, proper bracket formatting (braces on new lines), consistent naming conventions, comprehensive comments, proper error handling, global variable management, and consistency with embedded systems best practices.
+description: Enforce C coding standards for clarity and maintainability. Apply this skill whenever reviewing or writing C code, or when the user mentions code quality, C conventions, naming standards, variable naming, comments, error handling, function design, or code style. SKILL.md holds the platform-independent core rules (magic numbers replaced with macros, braces on new lines, consistent naming conventions, comprehensive comments, proper error handling, global variable management). For bare-metal/RTOS firmware also apply MCU_RTOS.md (ISR and volatile semantics, synchronization by execution context, critical sections, DMA coherency, stack/heap budgets, real-time limits, target/HIL verification). For Linux userspace applications also apply LINUX_USERSPACE.md (system calls and errno, file descriptor and memory pairing, safe string handling, short reads/writes and EINTR, pthreads and C11 atomics, signals, and sanitizer-based verification).
 ---
 
 # Embedded C Coding Conventions
 
-This skill enforces coding standards specifically designed for embedded systems development in C. The goal is to maximize code clarity, maintainability, safety, and team collaboration in resource-constrained environments.
+This skill provides platform-independent C coding conventions. The goal is to maximize code clarity, maintainability, safety, and team collaboration. Platform-specific rules live in separate documents: `MCU_RTOS.md` for bare-metal/RTOS firmware and `LINUX_USERSPACE.md` for Linux userspace applications. `SKILL.md` is the single source of truth for common rules; a platform document takes precedence only for the topics it explicitly covers.
 
 ## Core Conventions
 
@@ -48,7 +48,7 @@ if (adc_value > ADC_THRESHOLD_VOLTAGE) { ... }
 
 ### 2. Bracket Formatting - Braces on New Lines
 
-**Rationale**: Embedded code is often reviewed on small screens and in documentation. New-line braces improve readability and reduce merge conflicts in version control. This is the standard for embedded systems codebases (Linux kernel, MISRA C guidelines).
+**Rationale**: Embedded code is often reviewed on small screens and in documentation. New-line braces improve readability and reduce merge conflicts in version control. This style is common in embedded and safety-oriented codebases (for example, MISRA C guidelines); where the project already uses another style, follow the project convention.
 
 **Format**:
 - Opening brace `{` goes on a new line
@@ -258,13 +258,14 @@ typedef struct {
 
 **Good minimal comments (中文):**
 ```c
-// 为什么：禁用中断以防止临界段中的寄存器更新竞态条件
-DISABLE_INTERRUPTS();
+// 为什么：进入临界区以防止临界段中的寄存器更新竞态条件
+// platform_critical_enter/exit 代表平台临界区 API，保存并恢复中断状态
+uint32_t saved_state = platform_critical_enter();
 {
     TIMER->CR1 = timer_config_value;
     TIMER->CR2 = timer_prescale_value;
 }
-ENABLE_INTERRUPTS();
+platform_critical_exit(saved_state);
 
 // 为什么：轮询硬件状态而非忙轮询，允许调度器运行其他任务
 uint32_t deadline = get_ticks() + UART_READY_TIMEOUT_MS;
@@ -311,15 +312,15 @@ bool error_flag;              // 全局 - 可从任何地方设置
 
 ✅ **Good**:
 ```c
-// @brief UART 发送缓冲区（DMA 使用）
-// @rationale: DMA 控制器需要固定内存地址，必须是全局
-// @thread-safe: 由 ISR 中的中断禁用保护
+// @brief UART 发送缓冲区
+// @rationale: 需要在多次发送调用间保持内容，地址固定供底层发送逻辑使用
+// @thread-safe: 仅由发送状态机访问，所有权唯一
 static uint8_t s_uart_tx_buffer[UART_TX_BUFFER_SIZE] = {0};
 
 // @brief 发送缓冲区写指针
-// @rationale: ISR 和主任务都访问，必须是静态以控制可见性
-// @thread-safe: 32 位架构上的原子读写
-static volatile uint16_t s_uart_tx_index = 0;
+// @rationale: 需要在函数调用间持久化，必须是静态以控制可见性
+// @note: 仅在本文件内访问
+static uint16_t s_uart_tx_index = 0;
 
 // @brief 模块级状态机
 // @rationale: 需要在函数调用间持久化，必须是静态
@@ -591,96 +592,16 @@ log_info("Temperature: %d°C", temp);
 
 ---
 
-### 10. Race Condition and Thread-Safety Guidelines
+### 10. Concurrency - General Principles
 
-**Rationale**: Embedded systems often use interrupts and multiple tasks. Race conditions cause unpredictable bugs.
-
-#### 10.1 Critical Section Protection
+**Rationale**: Shared mutable state causes race conditions in any environment. The correct mechanism depends on which execution contexts share the resource; platform-specific mechanisms are defined in `MCU_RTOS.md` (ISR/task, task/task, DMA/CPU) and `LINUX_USERSPACE.md` (threads, signals).
 
 **Rules**:
-- Identify each shared resource and its readers, writers, and execution contexts.
-- Select synchronization according to the sharing context; see section 16 for ISR/task, task/task, and DMA/CPU guidance.
-- Use platform or RTOS critical-section APIs for short ISR-shared updates; use RTOS synchronization primitives for task/task sharing.
-- Do not assume disabling interrupts protects task/task access, DMA access, or every multi-core context.
-- Document the protected invariant and keep critical sections bounded.
-
-**Example (中文注释):**
-```c
-/**
- * @brief 通过 DMA 发送数据
- * @param p_data 数据指针
- * @param len 数据长度
- * @return ErrorCode_t - 成功返回 ERROR_SUCCESS
- * 
- * @details
- * 竞态条件说明：
- * - 修改 s_dma_ptr 和 s_dma_len 时可能被 DMA ISR 中断
- * - ISR 可能同时修改 s_dma_status
- * - 解决方案：禁用中断保护
- */
-ErrorCode_t uart_send_dma(const uint8_t *p_data, uint16_t len)
-{
-    if (!s_inited || p_data == NULL || len == 0)
-        return ERROR_INVALID_PARAM;
-    
-    // 为什么：DMA ISR 可能同时修改这些变量，需要原子操作
-    DISABLE_INTERRUPTS();
-    {
-        s_dma_ptr = (uint8_t *)p_data;
-        s_dma_len = len;
-        s_dma_status = DMA_STATUS_BUSY;
-        
-        // 启动 DMA
-        DMA->CR1 = DMA_ENABLE | DMA_FROM_MEMORY;
-    }
-    ENABLE_INTERRUPTS();
-    
-    return ERROR_SUCCESS;
-}
-```
-
-#### 10.2 Volatile Variables in ISR
-
-**Rules**:
-- As a conservative default, declare shared objects accessed by an ISR and foreground code as `volatile`, unless the platform/compiler contract provides a documented reason not to. This helps prevent inappropriate compiler caching or elimination of accesses.
-- `volatile` is not sufficient for atomicity, mutual exclusion, ordering of multi-step operations, or DMA/cache coherency; add the required atomic operation, critical section, RTOS synchronization, or cache maintenance independently.
-- Document which ISR accesses each shared object and the separate synchronization mechanism; see section 16.
-
-**Example (中文注释):**
-```c
-/**
- * @brief UART 接收缓冲写指针
- * @isr: uart_rx_isr() 写入，主任务读取
- * @thread-safe: ISR 独占写，主任务只读
- */
-static volatile uint16_t s_uart_rx_write_idx = 0;
-
-/**
- * @brief 上一个 ADC 采样值
- * @isr: adc_complete_isr() 更新
- * @thread-safe: ISR 原子写，主任务无保护读
- */
-static volatile uint16_t s_adc_value = 0;
-
-// ISR 中
-void uart_rx_isr(void)
-{
-    uint8_t byte = UART->DR;
-    s_uart_rx_buffer[s_uart_rx_write_idx] = byte;
-    s_uart_rx_write_idx = (s_uart_rx_write_idx + 1) % UART_RX_BUFFER_SIZE;
-}
-
-// 主任务中
-void main_task(void)
-{
-    uint16_t write_idx = s_uart_rx_write_idx;  // 读取 volatile 变量
-    if (write_idx != s_uart_rx_read_idx)
-    {
-        // 有新数据
-        uint8_t byte = s_uart_rx_buffer[s_uart_rx_read_idx];
-    }
-}
-```
+- Identify each shared resource and its readers, writers, and execution contexts before choosing a mechanism.
+- Select synchronization according to the sharing context; do not assume that disabling interrupts, `volatile`, or a single atomic operation protects a multi-step invariant.
+- Define a single owner for shared state where practical. Otherwise protect the whole invariant, not just individual fields.
+- Keep critical sections and lock-held regions short and bounded. Do not block, allocate memory, log synchronously, or call unknown callbacks while holding them.
+- Document the protected invariant, the participating contexts, and why the selected mechanism is sufficient.
 
 ---
 
@@ -1615,59 +1536,7 @@ p_data[1] = (uint8_t)((value >> 8) & UINT16_C(0x00FF));
 
 ---
 
-### 16. Concurrency, `volatile`, and Shared Resources
-
-**Rationale**: `volatile` does not provide atomicity, mutual exclusion, or inter-thread/ISR synchronization. The correct mechanism depends on which execution contexts share the resource.
-
-#### 16.1 `volatile` Semantics
-
-**Rules**:
-- Use `volatile` for memory-mapped registers according to the hardware/compiler contract. As a conservative default, also declare objects shared between an ISR and foreground code as `volatile`, unless a documented platform/compiler contract provides a reason not to.
-- Treat `volatile` as an access-visibility measure only. It does not provide atomicity, mutual exclusion, inter-thread synchronization, memory ordering for unrelated data, or DMA cache coherency; add the required atomic operation, critical section, RTOS lock, barrier, or cache maintenance independently.
-- A `volatile` read-modify-write expression is not automatically atomic. Multi-byte accesses may also be non-atomic on the target CPU.
-- For each shared object, document its writer(s), reader(s), execution contexts, and synchronization mechanism. Mark ISR access in comments when useful, but do not infer the needed synchronization from the annotation alone.
-
-#### 16.2 Select Synchronization by Sharing Context
-
-- **ISR and task**: Keep ISR work bounded. Use platform-supported atomic operations for naturally supported atomic state, or a short ISR-safe critical section / interrupt-masking API for small shared updates. Use an RTOS ISR-safe queue, semaphore, or notification to transfer work to a task. Never call a task-only RTOS API from an ISR.
-- **Task and task**: Protect shared mutable state with the RTOS mutex/semaphore or another documented synchronization primitive. Use atomics only for operations whose semantics and memory ordering are sufficient; atomics do not make a multi-step invariant atomic.
-- **DMA and CPU**: Follow the MCU and cache documentation for DMA-accessible memory, cache clean/invalidate operations, alignment, ownership transfer, and memory barriers. `volatile` alone does not make DMA buffers coherent.
-- **Multiple writers**: Define a single owner where practical. Otherwise use a synchronization mechanism that protects the whole invariant, not just individual fields.
-
-#### 16.3 Critical Sections
-
-**Rules**:
-- Use the platform or RTOS-provided critical-section API; do not invent generic `DISABLE_INTERRUPTS()` / `ENABLE_INTERRUPTS()` wrappers without a defined contract.
-- The API must preserve and restore the prior interrupt mask/state, or correctly support nesting. Blindly enabling interrupts on exit can incorrectly enable interrupts that were already disabled by the caller.
-- Keep critical sections short and bounded. Do not block, allocate memory, log synchronously, or perform slow peripheral operations while holding a critical section or mutex.
-- Document the protected data and why the selected critical section is sufficient for the participating contexts.
-
----
-
-### 17. Stack, Heap, and Real-Time Behavior
-
-**Rationale**: Memory budgets and bounded execution are correctness requirements in embedded systems, not only optimization concerns.
-
-#### 17.1 Stack and Heap
-
-**Rules**:
-- Define stack budgets for each RTOS task and for the interrupt/main stack where applicable. Check high-water marks or stack canaries during testing, and retain margin for worst-case call depth and interrupt nesting.
-- Avoid recursion and large automatic arrays on constrained stacks. Prefer static or caller-provided buffers when their lifetime and concurrency are well-defined; document the memory cost and sharing rules.
-- Decide explicitly whether dynamic allocation is allowed. If allowed, define permitted lifecycle phases, allocator constraints, fragmentation strategy, maximum allocation sizes, and failure handling.
-- Do not allocate or free memory from an ISR unless the allocator is explicitly documented as ISR-safe, bounded, and suitable for the system; the default rule is prohibited.
-- Every allocation failure must be handled. Do not assume initialization-time allocation always succeeds.
-
-#### 17.2 ISR and Timing Constraints
-
-**Rules**:
-- ISR handlers must have bounded execution time. Do not block, sleep/delay, wait for peripheral completion, perform unbounded loops, or call non-ISR-safe APIs from an ISR.
-- Defer lengthy processing, parsing, logging, and protocol/business work to a task using an ISR-safe handoff mechanism.
-- For timing-critical paths, specify and verify execution-time and blocking-time budgets, deadlines, and timeout behavior. Every wait for hardware or another task must have a defined timeout or documented bounded completion guarantee.
-- Do not use busy-wait loops where they can starve the scheduler or violate a timing budget; use an appropriate event, interrupt, or RTOS wait when available.
-
----
-
-### 18. Build, Static Analysis, and Verification
+### 16. Build, Static Analysis, and Verification
 
 **Rationale**: A coding convention is only useful if the target configuration can enforce and verify it.
 
@@ -1676,14 +1545,14 @@ p_data[1] = (uint8_t)((value >> 8) & UINT16_C(0x00FF));
 - Enable the project's agreed warning set and treat warnings as build failures where practical. New warnings must be fixed or narrowly suppressed with a documented reason; do not hide warnings through broad flags or casts.
 - Run static analysis and format/lint checks in the normal development workflow or CI. Keep suppressions local, justified, and reviewable.
 - Add unit tests for pure logic and boundary conditions. Prioritize protocol parsing/packing, integer limits, malformed or truncated frames, buffer boundaries, and error paths.
-- Perform target or hardware-in-the-loop validation for behavior that depends on peripherals, interrupt timing, DMA, memory layout, or compiler/ABI details; host tests alone are insufficient for these properties.
+- Apply platform-specific verification: target board/HIL validation per `MCU_RTOS.md`, or sanitizers and runtime diagnostics per `LINUX_USERSPACE.md`.
 - Record the commands or project targets used for build and verification so results can be reproduced.
 
 ---
 
 ## Code Review Checklist - Extended
 
-When reviewing embedded C code, verify:
+When reviewing C code, verify the common items below. Platform-specific checklists live in `MCU_RTOS.md` (firmware) and `LINUX_USERSPACE.md` (Linux userspace).
 
 **基础规范 (8 项)**
 - [ ] 有意义或可配置的常量有命名；不机械宏化明显的局部字面量
@@ -1710,27 +1579,16 @@ When reviewing embedded C code, verify:
 - [ ] 不依赖结构布局：不直接序列化结构体，不默认使用 enum/bool/位域/packed 作格式
 - [ ] 线缆字段宽度：使用明确宽度并验证解码值
 
-**并发安全 (6 项)**
-- [ ] 同步机制匹配上下文：ISR/任务、任务/任务、DMA/CPU 分别评估
-- [ ] ISR 与前台共享对象默认使用 `volatile`；另行保证原子性、互斥、内存顺序及 DMA 一致性
-- [ ] 临界区使用平台/RTOS API，支持正确恢复中断状态及嵌套
-- [ ] 临界区和锁持有时间短且有界
-- [ ] ISR 使用 ISR-safe API，并将耗时工作移交任务
-- [ ] DMA 缓存维护、屏障和所有权按芯片文档处理
+**并发通用 (3 项)**
+- [ ] 共享资源的读者、写者与执行上下文已识别
+- [ ] 同步机制与上下文匹配并保护整个不变量（平台细则见 `MCU_RTOS.md`/`LINUX_USERSPACE.md`）
+- [ ] 临界区/锁持有区域短小、有界，无阻塞、分配或同步日志
 
-**栈、堆与实时性 (5 项)**
-- [ ] 任务栈/中断栈有预算并通过高水位或 canary 检查
-- [ ] 受限路径没有不受控递归或大栈数组
-- [ ] 动态内存策略明确，分配失败有处理
-- [ ] ISR 无阻塞、延时、无界循环或非 ISR-safe 调用
-- [ ] 关键路径有执行/阻塞预算及超时策略
-
-**构建与验证 (5 项)**
+**构建与验证 (4 项)**
 - [ ] 编译器、目标、ABI、语言标准和关键构建参数可追溯
 - [ ] 告警集明确；新增告警已修复或局部说明抑制原因
 - [ ] 静态分析与格式检查已运行
 - [ ] 单元测试覆盖协议、边界、畸形输入及错误路径
-- [ ] 硬件相关行为已在目标板或 HIL 验证
 
 **内存安全 (4 项)**
 - [ ] 缓冲验证：len 检查（>0 和 ≤ MAX）
@@ -1793,6 +1651,8 @@ if (ready)
 
 ## When to Apply This Skill
 
+Apply the matching platform document together with these core rules: `MCU_RTOS.md` for bare-metal/RTOS firmware, `LINUX_USERSPACE.md` for Linux userspace applications.
+
 This skill applies in these scenarios:
 
 1. **Code Review**: Before merging pull requests, check against the full checklist
@@ -1805,10 +1665,8 @@ This skill applies in these scenarios:
 
 ## Future Enhancements
 
-This skill will be expanded with:
-- Memory management patterns (stack allocation, buffer management)
-- Interrupt-safe coding patterns (critical sections, atomic operations)
-- Function complexity guidelines (max parameters, max lines)
-- Test and assert macros for embedded testing
+This skill may be expanded with:
+- Test and assert macros for embedded and host-based testing
 - Performance optimization patterns
+- A Linux kernel platform document (`LINUX_KERNEL.md`) based on the kernel coding style
 
